@@ -1,0 +1,191 @@
+networks:
+  network-zabbix:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.10.0.0/24
+
+volumes:
+  postgres-data:
+  alertscripts-data:
+  mibs-data:
+  snmptraps-data:
+  zabbix-server-data:
+  zabbix-frontend:
+  grafana-data:
+  grafana-conf:
+  grafana-web:
+  traefik-certificates:
+  prometheus-data:
+
+services:
+  db:
+    container_name: zabbix_postgres
+    image: postgres:latest
+    networks:
+      network-zabbix:
+        ipv4_address: 10.10.0.10
+    restart: always
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    env_file:
+      - ./env/db.env
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    # healthcheck:
+      # test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      # interval: 30s
+      # timeout: 10s
+      # retries: 5
+
+  zabbix-server:
+    container_name: zabbix_server
+    image: zabbix/zabbix-server-pgsql:ubuntu-6.0-latest
+    networks:
+      network-zabbix:
+        ipv4_address: 10.10.0.11
+    restart: always
+    ports:
+      - "10051:10051"
+    volumes:
+      - snmptraps-data:/var/lib/zabbix/snmptraps
+      - alertscripts-data:/usr/lib/zabbix/alertscripts
+      - mibs-data:/var/lib/zabbix/mibs
+      - zabbix-server-data:/var/lib/zabbix/export
+    env_file:
+      - ./env/zbx-srv.env
+      - ./env/db.env
+    depends_on:
+      - db
+
+  zabbix-frontend:
+    container_name: zabbix_frontend
+    image: zabbix/zabbix-web-apache-pgsql:ubuntu-6.0-latest
+    networks:
+      network-zabbix:
+        ipv4_address: 10.10.0.12
+    restart: always
+    ports:
+      - "8080:8080"
+    volumes:
+      - zabbix-frontend:/usr/share/zabbix
+    env_file:
+      - ./env/zbx-web.env
+      - ./env/db.env
+    depends_on:
+      - db
+      - zabbix-server
+
+  zabbix-reports:
+    container_name: zabbix_reports
+    image: zabbix/zabbix-web-service:ubuntu-6.0-latest
+    networks:
+      network-zabbix:
+        ipv4_address: 10.10.0.13
+    restart: always
+    ports:
+      - "10053:10053"
+    env_file:
+      - ./env/zbx-rpt.env
+    depends_on:
+      - db
+      - zabbix-server
+      - zabbix-frontend
+    cap_add:
+      - SYS_ADMIN
+
+  grafana:
+    container_name: zabbix_grafana
+    image: grafana/grafana:9.5.13
+    networks:
+      network-zabbix:
+        ipv4_address: 10.10.0.14
+    restart: always
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - grafana-conf:/etc/grafana
+      - grafana-web:/usr/share/grafana/public
+    env_file:
+      - ./env/grafana.env
+    depends_on:
+      - db
+      - zabbix-server
+
+  prometheus:
+    container_name: zabbix_prometheus
+    image: prom/prometheus:latest
+    networks:
+      network-zabbix:
+        ipv4_address: 10.10.0.17
+    restart: always
+    ports:
+      - "9090:9090"
+    volumes:
+      - prometheus-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+    depends_on:
+      - db
+      - zabbix-server
+
+  traefik:
+    container_name: zabbix_traefik
+    image: traefik:latest
+    networks:
+      network-zabbix:
+        ipv4_address: 10.10.0.15
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - traefik-certificates:/etc/traefik/acme
+    env_file:
+      - ./env/traefik.env
+    command:
+      - "--log.level=WARN"
+      - "--accesslog=true"
+      - "--providers.docker=true"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      - "--providers.docker.exposedByDefault=false"
+      - "--providers.docker.endpoint=unix:///var/run/docker.sock"
+      - "--certificatesresolvers.letsencrypt.acme.tlschallenge=true"
+      - "--certificatesresolvers.letsencrypt.acme.email=${ACME_EMAIL}"
+      - "--certificatesresolvers.letsencrypt.acme.storage=/etc/traefik/acme/acme.json"
+    labels:
+      - "traefik.http.routers.http-catchall.rule=hostregexp(`{host:.+}`)"
+      - "traefik.http.routers.http-catchall.entrypoints=web"
+      - "traefik.http.routers.http-catchall.middlewares=redirect-to-https"
+      - "traefik.http.middlewares.redirect-to-https.redirectscheme.scheme=https"
+    depends_on:
+      - grafana
+      - zabbix-frontend
+
+  zabbix-agent:
+    container_name: zabbix_agent
+    image: zabbix/zabbix-agent:alpine-6.2-latest
+    networks:
+      network-zabbix:
+        ipv4_address: 10.10.0.16
+    restart: always
+    ports:
+      - "10050:10050"
+    env_file:
+      - ./env/zbx-agt.env
+    privileged: true
+    pid: host
+    stop_grace_period: 5s
+    labels:
+      com.zabbix.description: Zabbix Agent
+      com.zabbix.company: Zabbix LLC
+      com.zabbix.component: zabbix-agentd
+      com.zabbix.os: alpine
+
